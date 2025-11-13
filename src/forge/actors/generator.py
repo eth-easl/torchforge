@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from __future__ import annotations
-
 import asyncio
 import logging
 import os
@@ -23,13 +21,13 @@ from vllm.config import VllmConfig
 
 from vllm.engine.arg_utils import EngineArgs
 from vllm.entrypoints.utils import _validate_truncation_size
-from vllm.executor.multiproc_worker_utils import set_multiprocessing_worker_envs
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, SamplingParams
-from vllm.transformers_utils.tokenizer_group import init_tokenizer_from_configs
+from vllm.transformers_utils.tokenizer import init_tokenizer_from_configs
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import get_distributed_init_method
-from vllm.v1.core.kv_cache_utils import get_kv_cache_config
+from vllm.utils.network_utils import get_distributed_init_method
+from vllm.v1.executor.multiproc_executor import set_multiprocessing_worker_envs
+from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequest
@@ -40,7 +38,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.worker.worker_base import WorkerWrapperBase
+from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from forge.actors._torchstore_utils import (
     extract_param_name,
@@ -65,8 +63,7 @@ from forge.types import ProcessConfig
 from forge.util._shared_tensor import SharedTensor, SharedTensorHandle
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
+logger.setLevel(logging.DEBUG)
 
 @dataclass
 class Generator(ForgeActor):
@@ -125,7 +122,7 @@ class Generator(ForgeActor):
         return self.vllm_config
 
     @endpoint
-    async def register_worker(self, worker: GeneratorWorker) -> None:
+    async def register_worker(self, worker: "GeneratorWorker") -> None:
         self.worker = worker
         logger.debug("Registered GeneratorWorker on Generator.")
 
@@ -206,11 +203,9 @@ class Generator(ForgeActor):
         # TODO: add support for `log_stats` and `mm_registry`
         tokenizer = init_tokenizer_from_configs(
             model_config=self.vllm_config.model_config,
-            scheduler_config=self.vllm_config.scheduler_config,
-            lora_config=self.vllm_config.lora_config,
         )
         self.processor = Processor(
-            vllm_config=self.vllm_config, tokenizer=tokenizer, mm_registry=None
+            vllm_config=self.vllm_config, tokenizer=tokenizer
         )
         self.output_processor = OutputProcessor(tokenizer, log_stats=None)
 
@@ -229,7 +224,9 @@ class Generator(ForgeActor):
             structured_output_manager=structured_output_manager,
             include_finished_set=False,
             log_stats=None,
+            block_size=1,
         )
+        logger.debug(f"[Generator] setup complete, starting processing task...")
         self._start_processing()
         if self.prefetch_weights_to_shm:
             self._spawn_fetchers()
@@ -246,6 +243,7 @@ class Generator(ForgeActor):
         self.weight_fetchers = fetcher_procs.spawn("weight_fetcher", _WeightFetcher)
 
     def _start_processing(self):
+        logger.debug(f"[Generator] starting processing task...")
         if self._run_task is None or self._run_task.done():
             self._run_task = asyncio.create_task(self.run())
 
@@ -312,7 +310,7 @@ class Generator(ForgeActor):
             truncate_prompt_tokens,
             tokenization_kwargs,
         )
-        prompt_str, request = self.processor.process_inputs(
+        request = self.processor.process_inputs(
             request_id=request_id,
             prompt={"prompt": prompt},
             params=self.sampling_params,
@@ -323,7 +321,7 @@ class Generator(ForgeActor):
             data_parallel_rank=None,  # We do not support DP
         )
         t.step("process_inputs")
-
+        prompt_str = prompt
         # Wait until we're accepting requests (releases lock while waiting)
         # If accepting_requests is True, continue immediately (holding the lock)
         # If False, release lock, wait for notification, re-acquire and recheck
@@ -338,6 +336,7 @@ class Generator(ForgeActor):
                 self.requests[request_id] = (None, request_fut)
                 self.scheduler.add_request(request)
             else:
+                logger.debug(f"num_samples={num_samples}")
                 parent_req = ParentRequest(request_id, self.sampling_params)
                 for idx in range(num_samples):
                     # Note: `get_child_info` mutates ParentRequest to track the
@@ -351,12 +350,15 @@ class Generator(ForgeActor):
                     )
                     child_request, _ = self._preprocess_add_request(child_request)
                     self.scheduler.add_request(child_request)
+                    logger.debug(f"[Generator] added child request {child_request_id} for parent {request_id}")
                 request_fut = asyncio.Future()
                 self.requests[request_id] = (parent_req, request_fut)
-
+        
+        logger.debug(f"[Generator] added request {request_id}, waiting for completion...")
         completions = await request_fut
+        
         t.step("generate")
-
+        logger.debug(f"[Generator] Generated {len(completions)} completions: {completions}")
         # Log some metrics
         record_metric(
             "generator/generate/count_sequences_completed",
@@ -386,9 +388,9 @@ class Generator(ForgeActor):
         """(forge/issues/332) Will require attention when we bump vllm versions
         https://github.com/vllm-project/vllm/blob/0e3bb543f064eb416bca4f6f3013efa3830b12f7/vllm/v1/engine/core.py#L419
         """
-        if request.mm_hashes is not None:
-            raise NotImplementedError("Support for mm_hash is not implemented yet.")
-        req = Request.from_engine_core_request(request)
+        # if request.mm_hashes is not None:
+        #     raise NotImplementedError("Support for mm_hash is not implemented yet.")
+        req = Request.from_engine_core_request(request, block_hasher=None)
         if req.use_structured_output:
             self.scheduler.structured_output_manager.grammar_init(request)
         return req, 0
@@ -399,10 +401,22 @@ class Generator(ForgeActor):
         """
         # TODO: move postprocessing out of loop to not block
         self.running = True
+        logger.debug(f"[Generator] starting run loop... running={self.running}")
         while self.running:
             scheduler_output = self.scheduler.schedule()
+            if (
+                not scheduler_output.scheduled_new_reqs
+                and not scheduler_output.scheduled_cached_reqs.req_ids
+                and scheduler_output.total_num_scheduled_tokens == 0
+                and not scheduler_output.scheduled_spec_decode_tokens
+                and not scheduler_output.scheduled_encoder_inputs
+            ):
+                # Nothing ready to execute yet; yield control so new requests can queue up.
+                await asyncio.sleep(0)
+                continue
+            logger.debug(f"[Generator] sending {scheduler_output} to worker... running={self.running}")
             worker_outputs = await self.worker.execute_model.call(scheduler_output)
-
+            logger.debug(f"[Generator] got worker outputs: {worker_outputs.keys()}")
             # The results of `execute_model` are gathered on the driver rank (rank 0)
             _, worker_output = next(worker_outputs.items())
             outputs = self.scheduler.update_from_output(scheduler_output, worker_output)
@@ -414,6 +428,7 @@ class Generator(ForgeActor):
                 engine_core_timestamp=outputs.timestamp,
                 iteration_stats=None,  # TODO: add support for `iteration_stats`
             )
+            logger.debug(f"[Generator] processed outputs: {processed_outputs}")
             for request_output in processed_outputs.request_outputs:
                 if request_output.finished:
                     completions = self._to_completions(request_output)
@@ -595,7 +610,7 @@ class GeneratorWorker(ForgeActor):
         self.rank = current_rank().rank
         os.environ["RANK"] = str(self.rank)
         parallel_config = self.vllm_config.parallel_config
-        set_multiprocessing_worker_envs(parallel_config)
+        set_multiprocessing_worker_envs()
         ip, port = os.getenv("MASTER_ADDR"), os.getenv("MASTER_PORT")
         distributed_init_method = get_distributed_init_method(ip, port)
         all_kwargs = [{}] * parallel_config.world_size
@@ -622,11 +637,12 @@ class GeneratorWorker(ForgeActor):
         else:
             # Attention free models don't need memory for kv cache
             available_gpu_memory = 0
-
+        kv_cache_spec = [kv_cache_spec] * self.vllm_config.parallel_config.world_size
         # Get the kv cache tensor size
-        kv_cache_config = get_kv_cache_config(
-            self.vllm_config, kv_cache_spec, available_gpu_memory
+        kv_cache_configs = get_kv_cache_configs(
+            self.vllm_config, kv_cache_spec, [available_gpu_memory] * self.vllm_config.parallel_config.world_size
         )
+        kv_cache_config = kv_cache_configs[self.rank]
         # TODO: unify configs across TorchStore
         # unify_kv_cache_configs(kv_cache_configs)
         self.vllm_config.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
@@ -634,8 +650,8 @@ class GeneratorWorker(ForgeActor):
 
         # Initialize kv cache and warmup the execution:
         # from multiproc_executor.py:MultiprocExecutor.initialize_from_config
-        kv_cache_configs = [None] * self.vllm_config.parallel_config.world_size
-        kv_cache_configs[self.rank] = kv_cache_config
+        # kv_cache_configs = [None] * self.vllm_config.parallel_config.world_size
+        # kv_cache_configs[self.rank] = kv_cache_config
         self.worker.initialize_from_config(kv_cache_configs)
         self.worker.compile_or_warm_up_model()
         self.worker.initialize_cache(kv_cache_config.num_blocks, 0)
@@ -643,6 +659,7 @@ class GeneratorWorker(ForgeActor):
 
     @endpoint
     async def execute_model(self, schedule: SchedulerOutput) -> ModelRunnerOutput:
+        logger.debug(f"execute_model called with schedule: {schedule}")
         return self.worker.execute_model(schedule)
 
     @endpoint
